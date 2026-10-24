@@ -6,7 +6,7 @@ The project is intentionally small: a Node.js daemon, a SQLite queue/store, Disc
 
 ## Highlights
 
-- **Thread-per-session workflow** — one Discord thread maps to one persistent OMP session directory.
+- **Thread-per-session workflow** — one Discord thread maps to one persistent OMP session.
 - **Mention-triggered session creation** — restrict startup to approved guilds, parent channels, and users.
 - **Durable SQLite state** — sessions and queued turns survive daemon restarts.
 - **Serialized per-thread queue** — multiple users can enqueue turns safely while global concurrency stays bounded.
@@ -53,7 +53,7 @@ Bridge/session commands remain prefixed to avoid collisions:
 ## Requirements
 
 - Node.js **24+** (`node:sqlite` is used directly).
-- OMP available as `omp` on `PATH` (or set `OMP_CLI_PATH` to the executable).
+- OMP npm installation available as `omp` on `PATH` (or set `OMP_CLI_PATH` to its executable), plus Bun on the daemon's `PATH`. Native MCP integration is validated with OMP **18.8.0** and requires its published `src/` modules; standalone OMP binaries and arbitrary wrapper scripts are not supported.
 - A Discord bot token.
 - Discord bot settings:
   - Message Content Intent enabled.
@@ -134,7 +134,7 @@ runtime:
 | `discord.slashCommands.syncOnStart` | Replace guild slash commands with the generated command set on daemon startup. |
 | `discord.slashCommands.acpCommands` | `auto`, `core`, or an explicit array of ACP command metadata. |
 | `omp.cwd` | Working directory used for OMP sessions. |
-| `omp.sessionRoot` | Directory where per-thread OMP session directories are created. |
+| `omp.sessionRoot` | Per-thread association directories containing `acp-session.json`; journals live in OMP's standard session storage. |
 | `runtime.followupMode` | `steer` sends follow-ups into the running turn when possible; `queue` always queues. |
 | `runtime.maxConcurrency` | Maximum number of threads with active OMP turns at once. |
 | `runtime.discordMessageLimit` | Chunk size cap for outbound Discord messages. |
@@ -154,6 +154,22 @@ discord:
         description: Run the TDD skill
         inputHint: task description
 ```
+
+## MCP configuration, OAuth, and session recovery
+
+The bridge discovers enabled **user-level** MCP servers using the selected OMP installation's native configuration loader. This includes `~/.omp/agent/mcp.json` (or the active agent/profile directory), native disable lists, and other user-level sources supported by OMP. Project-level MCP configuration is deliberately excluded: changing a repository must not silently grant Discord access to more tools. With no configured servers, ordinary non-MCP sessions remain available.
+
+Each server is exposed to ACP through a local stdio adapter. The adapter uses OMP's native MCP manager and credential storage, preserving transport configuration, environment/header resolution, OAuth token lookup, and HTTP token refresh. Tokens are not placed in ACP server definitions or process arguments. Adapter failures return generic errors rather than upstream messages that might contain credentials. Initial OAuth login or reauthorization must be completed in a trusted local OMP session, not through Discord.
+
+The first turn waits for the initial MCP connections and tool lists; the bridge sets `OMP_MCP_STARTUP_TIMEOUT_MS=0` rather than allowing OMP's short background-startup window to hide tools from the first prompt. An enabled server that cannot connect fails session initialization instead of silently disappearing. OMP's normal request timeouts still apply. Disable unavailable servers in trusted user configuration before retrying.
+
+Run OMP and the daemon as the same OS user, with the same agent/profile and credential-broker environment. Verify Plane authorization locally by actually calling `workspace.retrieve`; an unauthenticated HTTP 401 does not establish whether the stored OAuth grant works. Restrict Discord guild/channel/user allowlists to trusted users: enabled user MCP servers grant their capabilities to those sessions.
+
+New sessions use OMP's standard journal directory, with an atomic `acp-session.json` reference under each Discord thread directory. Restarting the daemon loads the recorded ACP session ID and reapplies the MCP servers. `new` creates a distinct session and updates that reference without deleting previous history.
+
+On first recovery of an older thread, the newest journal in its legacy thread directory is moved, together with its artifacts, using OMP's native session API into standard storage. The reference is written before migration and updated afterward so an interrupted move can be recovered. Back up the bridge database, thread directories, and OMP session storage before upgrading. Journals become visible in OMP's ordinary session listing; do not delete the per-thread association directories.
+
+For deployment, inspect the service manager's actual `ExecStart`, checkout, OS user, and environment before building. Build the reviewed checkout with `npm ci && npm run check`, then point the service at that checkout's `dist/src/daemon.js` and restart it. Do not assume a similarly named checkout is the deployed one. After restart, verify both a new Discord thread and a previously used thread can call Plane `workspace.retrieve` and return the expected workspace; verify the old thread still remembers prior conversation. No history reset is required.
 
 ## Discord setup checklist
 
@@ -176,6 +192,12 @@ npm run check
 ```
 
 `npm run check` runs typechecking, the Vitest suite, and a production build.
+
+The optional native integration suite exercises the actual ACP initialization boundary, MCP tool visibility in new/restored sessions, legacy migration, no-MCP recovery, and user/project access scope. It uses isolated temporary agent directories and a loopback MCP server, with no model calls or personal credentials:
+
+```bash
+OMP_NATIVE_TEST_CLI="$(command -v omp)" npm test -- tests/omp-mcp.integration.test.ts
+```
 
 The test suite covers:
 

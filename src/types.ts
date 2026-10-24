@@ -83,6 +83,7 @@ export interface OmpPromptResult {
 
 export interface OmpSessionHandle {
   id: string;
+  readonly sessionFile?: string | undefined;
   prompt(message: string, signal?: AbortSignal): Promise<OmpPromptResult>;
   steer?(message: string): Promise<void> | void;
   availableCommands?(): Promise<BridgeAvailableCommand[]> | BridgeAvailableCommand[];

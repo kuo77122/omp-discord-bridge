@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { ClientSideConnection, PROTOCOL_VERSION, ndJsonStream, type AvailableCommand, type Client as AcpClient, type SessionNotification } from "@agentclientprotocol/sdk";
 import type { DiscordSessionRecord, OmpSessionFactory, OmpSessionHandle, OmpPromptResult } from "./types.js";
+import { prepareAcpSession } from "./mcp.js";
 
 type AcpLaunchInput = {
   cwd: string;
@@ -58,7 +59,10 @@ export class AcpOmpSessionFactory implements OmpSessionFactory {
   async newSession(record: DiscordSessionRecord): Promise<OmpSessionHandle> {
     this.handles.get(record.threadId)?.close();
     this.handles.delete(record.threadId);
-    return this.open(record);
+    const handle = new AcpProcessSessionHandle(record, this.options, false);
+    this.handles.set(record.threadId, handle);
+    await handle.availableCommands();
+    return handle;
   }
   close(): void {
     for (const handle of this.handles.values()) handle.close();
@@ -73,8 +77,9 @@ class AcpProcessSessionHandle implements OmpSessionHandle {
   private ready: Promise<void> | null = null;
   private textBuffer = "";
   private commands: AvailableCommand[] = [];
+  sessionFile: string | undefined;
 
-  constructor(private record: DiscordSessionRecord, private options: { cliPath?: string; env?: Record<string, string> } = {}) {}
+  constructor(private record: DiscordSessionRecord, private options: { cliPath?: string; env?: Record<string, string> } = {}, private resume = true) {}
 
   get id(): string { return this.record.threadId; }
 
@@ -87,7 +92,7 @@ class AcpProcessSessionHandle implements OmpSessionHandle {
     signal?.addEventListener("abort", abort, { once: true });
     try {
       await this.connection.prompt({ sessionId: this.sessionId, prompt: [{ type: "text", text: message }] });
-      return { text: this.textBuffer || "(OMP completed without text output)", sessionFile: path.join(this.record.sessionDir, `${this.record.threadId}.json`) };
+      return { text: this.textBuffer || "(OMP completed without text output)", ...(this.sessionFile ? { sessionFile: this.sessionFile } : {}) };
     } finally {
       signal?.removeEventListener("abort", abort);
     }
@@ -112,12 +117,17 @@ class AcpProcessSessionHandle implements OmpSessionHandle {
 
   private async start(): Promise<void> {
     if (this.ready) return this.ready;
-    this.ready = this.openAcp();
+    this.ready = this.openAcp().catch((error: unknown) => { this.close(); throw error; });
     return this.ready;
   }
 
+
   private async openAcp(): Promise<void> {
     const launch = buildAcpLaunch({ cwd: this.record.cwd, sessionDir: this.record.sessionDir, model: this.record.model, thinkingLevel: this.record.thinkingLevel, ...(this.options.cliPath ? { cliPath: this.options.cliPath } : {}), ...(this.options.env ? { env: this.options.env } : {}) });
+    // ACP must expose MCP tools before accepting the first Discord turn.
+    launch.env.OMP_MCP_STARTUP_TIMEOUT_MS = "0";
+    const { mcpServers, sessionDir, stored } = await prepareAcpSession(launch, this.record.sessionDir, this.resume);
+    launch.args[2] = sessionDir;
     this.child = spawn(launch.command, launch.args, { cwd: launch.cwd, env: launch.env, stdio: ["pipe", "pipe", "pipe"] });
     this.child.stderr.on("data", (chunk) => process.stderr.write(`[omp-acp:${this.record.threadId}] ${chunk}`));
     const client: AcpClient = {
@@ -126,16 +136,28 @@ class AcpProcessSessionHandle implements OmpSessionHandle {
     };
     const stream = ndJsonStream(Writable.toWeb(this.child.stdin), Readable.toWeb(this.child.stdout));
     this.connection = new ClientSideConnection(() => client, stream);
-    await this.connection.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
-    const created = await this.connection.newSession({ cwd: this.record.cwd, mcpServers: [] });
-    this.sessionId = created.sessionId;
+    const initialized = await this.connection.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    if (stored) {
+      if (!initialized.agentCapabilities?.loadSession) throw new Error("Selected OMP cannot restore ACP sessions");
+      await this.connection.loadSession({ sessionId: stored.id, cwd: this.record.cwd, mcpServers });
+      this.sessionId = stored.id;
+    } else {
+      const created = await this.connection.newSession({ cwd: this.record.cwd, mcpServers });
+      this.sessionId = created.sessionId;
+    }
+    const filename = fs.readdirSync(sessionDir).find((file) => file.endsWith(`_${this.sessionId}.jsonl`));
+    if (!filename) throw new Error("OMP did not persist the ACP session");
+    this.sessionFile = path.join(sessionDir, filename);
+    const reference = path.join(this.record.sessionDir, "acp-session.json");
+    fs.writeFileSync(`${reference}.tmp`, JSON.stringify({ id: this.sessionId, file: this.sessionFile }), { mode: 0o600 });
+    fs.renameSync(`${reference}.tmp`, reference);
   }
 
   private handleSessionUpdate(params: SessionNotification): void {
     if (this.sessionId && params.sessionId !== this.sessionId) return;
-    const update: any = params.update;
-    if (update?.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) this.commands = update.availableCommands;
-    if (update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text" && typeof update.content.text === "string") this.textBuffer += update.content.text;
+    const update = params.update;
+    if (update.sessionUpdate === "available_commands_update") this.commands = update.availableCommands;
+    if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") this.textBuffer += update.content.text;
   }
 }
 

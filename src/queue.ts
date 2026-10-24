@@ -40,7 +40,7 @@ export class ThreadQueueRunner {
     const session = this.deps.store.getSession(threadId);
     if (!session) return this.deps.messenger.send(threadId, "No OMP session is mapped to this thread.");
     const handle = await this.deps.omp.newSession(session);
-    this.deps.store.updateSession(threadId, { status: "active", sessionFile: `${session.sessionDir}/${handle.id}.json` });
+    this.deps.store.updateSession(threadId, { status: "active", ...(handle.sessionFile ? { sessionFile: handle.sessionFile } : {}) });
     await this.deps.messenger.send(threadId, "Started a fresh OMP session for this Discord thread.");
   }
 
